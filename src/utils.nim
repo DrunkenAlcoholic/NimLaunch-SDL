@@ -5,7 +5,7 @@
 ##   • recent-application JSON persistence
 ##   • app-usage JSON persistence
 
-import std/[os, strutils, json, options, times, tables]
+import std/[os, strutils, json, options, times, tables, syncio]
 import ./[state, paths]
 
 
@@ -41,6 +41,14 @@ proc parseHexRgb8*(hex: string): Option[Rgb] =
 let recentFile* = cacheDir() / "recent.json"
 let usageFile* = cacheDir() / "usage.json"
 
+## Return the stable desktop identity used by history and usage data.
+proc appIdentity*(app: DesktopApp): string =
+  if app.desktopId.len > 0:
+    return app.desktopId
+  if app.desktopFile.len > 0:
+    return app.desktopFile
+  app.exec
+
 proc loadRecent*() =
   ## Populate ctx.recentApps from disk; log on error.
   if fileExists(recentFile):
@@ -49,7 +57,8 @@ proc loadRecent*() =
       ctx.recentApps = j.to(seq[string])
     except IOError, OSError, ValueError:
       let e = getCurrentException()
-      echo "loadRecent warning: ", recentFile, " (", e.name, "): ", e.msg
+      stderr.writeLine "loadRecent warning: " & recentFile & " (" & $e.name &
+          "): " & e.msg
 
 proc saveRecent*() =
   ## Persist ctx.recentApps to disk; log on error.
@@ -58,7 +67,8 @@ proc saveRecent*() =
     writeFile(recentFile, $ %ctx.recentApps)
   except IOError, OSError:
     let e = getCurrentException()
-    echo "saveRecent warning: ", recentFile, " (", e.name, "): ", e.msg
+    stderr.writeLine "saveRecent warning: " & recentFile & " (" & $e.name &
+        "): " & e.msg
 
 proc loadUsage*() =
   ## Populate per-app usage stats from disk; log on error.
@@ -69,7 +79,8 @@ proc loadUsage*() =
       ctx.appUsage = j.to(Table[string, AppUsage])
     except IOError, OSError, ValueError:
       let e = getCurrentException()
-      echo "loadUsage warning: ", usageFile, " (", e.name, "): ", e.msg
+      stderr.writeLine "loadUsage warning: " & usageFile & " (" & $e.name &
+          "): " & e.msg
 
 proc saveUsage*() =
   ## Persist per-app usage stats to disk; log on error.
@@ -78,21 +89,23 @@ proc saveUsage*() =
     writeFile(usageFile, $ %ctx.appUsage)
   except IOError, OSError:
     let e = getCurrentException()
-    echo "saveUsage warning: ", usageFile, " (", e.name, "): ", e.msg
+    stderr.writeLine "saveUsage warning: " & usageFile & " (" & $e.name &
+        "): " & e.msg
 
-proc recordAppLaunch*(name: string) =
+proc recordAppLaunch*(app: DesktopApp) =
   ## Update MRU ordering and persistent launch stats for an app-like action.
-  if name.len == 0:
+  let key = appIdentity(app)
+  if key.len == 0:
     return
-  let ri = ctx.recentApps.find(name)
+  let ri = ctx.recentApps.find(key)
   if ri >= 0:
     ctx.recentApps.delete(ri)
-  ctx.recentApps.insert(name, 0)
+  ctx.recentApps.insert(key, 0)
   if ctx.recentApps.len > maxRecent:
     ctx.recentApps.setLen(maxRecent)
-  var stats = ctx.appUsage.getOrDefault(name)
+  var stats = ctx.appUsage.getOrDefault(key)
   inc stats.launchCount
   stats.lastLaunched = epochTime().int64
-  ctx.appUsage[name] = stats
+  ctx.appUsage[key] = stats
   saveRecent()
   saveUsage()

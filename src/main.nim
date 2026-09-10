@@ -2,7 +2,7 @@ import std/[os, strutils, syncio]
 import sdl3
 import ./[state, app_core, gui, utils, settings, search, input, apps_cache, theme_session]
 
-const Version = "0.11.4"
+const Version = "0.11.5"
 
 # Print the command-line synopsis and available options.
 proc printUsage() =
@@ -111,6 +111,7 @@ proc main*() =
     loadApplications()
     loadRecent()
     loadUsage()
+    startSearchWorker()
   buildActions()
 
   resetVimState()
@@ -120,7 +121,6 @@ proc main*() =
   gui.updateGuiColors()
   gui.redrawWindow()
 
-  var suppressNextTextInput = false
   var ev: Event
   var focus: FocusState
   focus.startMs = gui.nowMs()
@@ -138,10 +138,10 @@ proc main*() =
         if handleWindowEvent(ev, focus):
           gui.redrawWindow()
       of EVENT_KEY_DOWN:
-        if handleKeyDown(ev, focus, suppressNextTextInput):
+        if handleKeyDown(ev, focus):
           gui.redrawWindow()
       of EVENT_TEXT_INPUT:
-        if handleTextInput(ev, focus, suppressNextTextInput):
+        if handleTextInput(ev, focus):
           gui.redrawWindow()
       of EVENT_TEXT_EDITING:
         if handleTextEditing(ev):
@@ -160,10 +160,19 @@ proc main*() =
       gui.redrawWindow()
       continue
 
+    if pollSearchUpdates():
+      gui.redrawWindow()
+      continue
+
+    if gui.needsTimedRedraw():
+      gui.redrawWindow()
+
     delay(ctx.config.pollIntervalMs.uint32)
 
   if ctx.themePreviewActive:
     endThemePreviewSession(false)
+
+  stopSearchWorker()
 
   if ctx.verboseMode:
     let uptimeMs = gui.nowMs() - startupTimeMs
@@ -175,7 +184,8 @@ proc main*() =
   gui.shutdownGui()
   if ctx.dmenuMode:
     if ctx.dmenuAccepted:
-      stdout.write(ctx.dmenuOutput & "\n")
+      if not ctx.dmenuDryRunAccepted:
+        stdout.write(ctx.dmenuOutput & "\n")
       quit 0
     quit 1
 

@@ -1,6 +1,6 @@
 ## settings.nim — config and theme loading for NimLaunch.
 
-import std/[os, strutils, math, options, tables]
+import std/[os, strutils, math, options, tables, syncio]
 import parsetoml as toml
 import ./[state as st, gui, utils, paths]
 
@@ -76,8 +76,43 @@ proc applyThemeAndColors*(cfg: var Config; name: string; doNotify = true;
   if doRedraw:
     gui.redrawWindow()
 
-proc saveLastTheme*(cfgPath: string) =
-  ## Update or insert [theme].last_chosen = "<name>" in the TOML file.
+## Split a TOML line at the first comment marker outside a quoted string.
+proc splitTomlComment(line: string): tuple[code, comment: string] =
+  var quote = '\0'
+  var escaped = false
+  for i, ch in line:
+    if quote == '"' and escaped:
+      escaped = false
+    elif quote == '"' and ch == '\\':
+      escaped = true
+    elif quote == '\0' and (ch == '"' or ch == '\''):
+      quote = ch
+    elif quote == ch:
+      quote = '\0'
+    elif quote == '\0' and ch == '#':
+      return (line[0..<i], line[i..^1])
+  (line, "")
+
+## Normalize a bare or simply quoted TOML key for comparison.
+proc normalizedTomlKey(value: string): string =
+  result = value.strip()
+  if result.len >= 2 and
+      ((result[0] == '"' and result[^1] == '"') or
+       (result[0] == '\'' and result[^1] == '\'')):
+    result = result[1..^2]
+
+## Return a simple TOML table or array-table name, or empty for other lines.
+proc tomlSectionName(code: string): string =
+  let stripped = code.strip()
+  if stripped.len >= 4 and stripped.startsWith("[[") and
+      stripped.endsWith("]]"):
+    return normalizedTomlKey(stripped[2..^3])
+  if stripped.len >= 2 and stripped[0] == '[' and stripped[^1] == ']':
+    return normalizedTomlKey(stripped[1..^2])
+  ""
+
+## Safely update or insert theme.last_chosen while preserving other text.
+proc saveLastTheme*(cfgPath: string): bool =
   let escapedTheme = tomlEscapeBasicString(ctx.config.themeName)
   let lastChosenLine = "last_chosen = \"" & escapedTheme & "\""
   var lines: seq[string]
@@ -85,43 +120,73 @@ proc saveLastTheme*(cfgPath: string) =
     lines = readFile(cfgPath).splitLines()
   except IOError, OSError:
     let e = getCurrentException()
-    if ctx.verboseMode: echo "saveLastTheme warning: unable to read ", cfgPath, " (", e.name, "): ", e.msg
-    return
+    stderr.writeLine "saveLastTheme warning: unable to read " & cfgPath &
+        " (" & $e.name & "): " & e.msg
+    return false
+
+  var output: seq[string] = @[]
   var inTheme = false
   var updated = false
   var themeSectionFound = false
-  for i in 0..<lines.len:
-    let l = lines[i].strip()
-    if l.toLowerAscii() == "[theme]":
-      inTheme = true
-      themeSectionFound = true
-      continue
-    if inTheme:
-      if l.startsWith("[") and l.endsWith("]"):
-        lines.insert(lastChosenLine, i)
+  for line in lines:
+    let (code, comment) = splitTomlComment(line)
+    let section = tomlSectionName(code)
+    if section.len > 0:
+      if inTheme and not updated:
+        output.add(lastChosenLine)
         updated = true
-        inTheme = false
-        break
-      let eq = l.find('=')
-      if eq > 0 and l[0 ..< eq].strip() == "last_chosen":
-        lines[i] = lastChosenLine
-        updated = true
-        inTheme = false
-        break
+      inTheme = section == "theme"
+      if inTheme:
+        themeSectionFound = true
+
+    let eq = code.find('=')
+    if inTheme and eq > 0 and
+        normalizedTomlKey(code[0..<eq]) == "last_chosen":
+      if not updated:
+        let indentLen = line.len - line.strip(leading = true, trailing = false).len
+        let indent = if indentLen > 0: line[0..<indentLen] else: ""
+        let suffix = if comment.len > 0: " " & comment else: ""
+        output.add(indent & lastChosenLine & suffix)
+      updated = true
+    else:
+      output.add(line)
+
   if inTheme and not updated:
-    lines.add(lastChosenLine)
+    output.add(lastChosenLine)
     updated = true
   if not themeSectionFound:
-    lines.add("")
-    lines.add("[theme]")
-    lines.add(lastChosenLine)
+    output.add("")
+    output.add("[theme]")
+    output.add(lastChosenLine)
     updated = true
-  if updated:
-    try:
-      writeFile(cfgPath, lines.join("\n"))
-    except IOError, OSError:
-      let e = getCurrentException()
-      if ctx.verboseMode: echo "saveLastTheme warning: unable to write ", cfgPath, " (", e.name, "): ", e.msg
+
+  if not updated:
+    return true
+
+  let candidate = output.join("\n") & "\n"
+  try:
+    discard toml.parseString(candidate)
+  except CatchableError as e:
+    stderr.writeLine "saveLastTheme warning: refusing invalid TOML update for " &
+        cfgPath & " (" & $e.name & "): " & e.msg
+    return false
+
+  let tempPath = cfgPath & ".tmp." & $getCurrentProcessId()
+  try:
+    writeFile(tempPath, candidate)
+    setFilePermissions(tempPath, getFilePermissions(cfgPath))
+    moveFile(tempPath, cfgPath)
+    true
+  except IOError, OSError:
+    let e = getCurrentException()
+    if fileExists(tempPath):
+      try:
+        removeFile(tempPath)
+      except CatchableError:
+        discard
+    stderr.writeLine "saveLastTheme warning: unable to write " & cfgPath &
+        " (" & $e.name & "): " & e.msg
+    false
 
 proc loadShortcutsSection(tbl: toml.TomlValueRef; cfgPath: string) =
   ## Populate `ctx.shortcuts` from `[[shortcuts]]` entries in *tbl*.
@@ -172,10 +237,10 @@ proc loadShortcutsSection(tbl: toml.TomlValueRef; cfgPath: string) =
       except CatchableError:
         inc invalidCount
     if invalidCount > 0:
-      echo "NimLaunch warning: skipped ", invalidCount,
-          " invalid [[shortcuts]] entries in ", cfgPath
+      stderr.writeLine "NimLaunch warning: skipped " & $invalidCount &
+          " invalid [[shortcuts]] entries in " & cfgPath
   except CatchableError:
-    echo "NimLaunch warning: ignoring invalid [[shortcuts]] entries in ", cfgPath
+    stderr.writeLine "NimLaunch warning: ignoring invalid [[shortcuts]] entries in " & cfgPath
 
 proc parseGroupQueryMode(modeStr: string): GroupQueryMode =
   case modeStr
@@ -200,10 +265,10 @@ proc loadGroupsSection(tbl: toml.TomlValueRef; cfgPath: string) =
       except CatchableError:
         inc invalidCount
     if invalidCount > 0:
-      echo "NimLaunch warning: skipped ", invalidCount,
-          " invalid [[groups]] entries in ", cfgPath
+      stderr.writeLine "NimLaunch warning: skipped " & $invalidCount &
+          " invalid [[groups]] entries in " & cfgPath
   except CatchableError:
-    echo "NimLaunch warning: ignoring invalid [[groups]] entries in ", cfgPath
+    stderr.writeLine "NimLaunch warning: ignoring invalid [[groups]] entries in " & cfgPath
 
 proc ensureGroupDefaults() =
   ## Ensure every shortcut group exists with a default query mode.
@@ -244,20 +309,22 @@ proc initLauncherConfig*() =
     try:
       createDir(parentDir(cfgPath))
       writeFile(cfgPath, defaultToml)
-      echo "Created default config at ", cfgPath
+      stderr.writeLine "Created default config at " & cfgPath
     except CatchableError as e:
-      echo "NimLaunch warning: unable to write default config at ", cfgPath,
-          " (", e.name, "): ", e.msg
+      stderr.writeLine "NimLaunch warning: unable to write default config at " &
+          cfgPath & " (" & $e.name & "): " & e.msg
 
   ## Parse TOML
   var tbl: toml.TomlValueRef
+  var configValid = true
   try:
     tbl = toml.parseFile(cfgPath)
   except CatchableError as e:
-    echo "NimLaunch config error: failed to parse ", cfgPath
-    echo "  ", e.name, ": ", e.msg
-    echo "  NimLaunch is ignoring this file and using built-in defaults for this session."
-    echo "  Fix the TOML file and restart NimLaunch to restore your saved settings."
+    configValid = false
+    stderr.writeLine "NimLaunch config error: failed to parse " & cfgPath
+    stderr.writeLine "  " & $e.name & ": " & e.msg
+    stderr.writeLine "  NimLaunch is ignoring this file and using built-in defaults for this session."
+    stderr.writeLine "  Fix the TOML file and restart NimLaunch to restore your saved settings."
     tbl = toml.parseString(defaultToml)
 
   ## window
@@ -281,7 +348,7 @@ proc initLauncherConfig*() =
           ctx.config.pollIntervalMs)
       ctx.config.opacity = w.getOrDefault("opacity").getFloat(ctx.config.opacity)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [window] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [window] section in " & cfgPath
 
   ## font
   if tbl.hasKey("font"):
@@ -289,7 +356,7 @@ proc initLauncherConfig*() =
       let f = tbl["font"].getTable()
       ctx.config.fontName = f.getOrDefault("fontname").getStr(ctx.config.fontName)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [font] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [font] section in " & cfgPath
 
   ## input
   if tbl.hasKey("input"):
@@ -300,7 +367,7 @@ proc initLauncherConfig*() =
       ctx.config.vimMode = inp.getOrDefault("vim_mode").getBool(
           ctx.config.vimMode)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [input] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [input] section in " & cfgPath
 
   ## terminal
   if tbl.hasKey("terminal"):
@@ -309,7 +376,7 @@ proc initLauncherConfig*() =
       ctx.config.terminalExe = term.getOrDefault("program").getStr(
           ctx.config.terminalExe)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [terminal] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [terminal] section in " & cfgPath
 
 
   ## border
@@ -319,7 +386,7 @@ proc initLauncherConfig*() =
       ctx.config.borderWidth = b.getOrDefault("width").getInt(
           ctx.config.borderWidth)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [border] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [border] section in " & cfgPath
 
   ## icons
   if tbl.hasKey("icons"):
@@ -328,7 +395,7 @@ proc initLauncherConfig*() =
       ctx.config.showIcons = ic.getOrDefault("enabled").getBool(
           ctx.config.showIcons)
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [icons] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [icons] section in " & cfgPath
 
   ## themes
   ctx.themeList = @[]
@@ -352,10 +419,10 @@ proc initLauncherConfig*() =
         except CatchableError:
           inc invalidCount
       if invalidCount > 0:
-        echo "NimLaunch warning: skipped ", invalidCount,
-            " invalid [[themes]] entries in ", cfgPath
+        stderr.writeLine "NimLaunch warning: skipped " & $invalidCount &
+            " invalid [[themes]] entries in " & cfgPath
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [[themes]] entries in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [[themes]] entries in " & cfgPath
 
   loadGroupsSection(tbl, cfgPath)
   loadShortcutsSection(tbl, cfgPath)
@@ -368,7 +435,7 @@ proc initLauncherConfig*() =
       let themeTbl = tbl["theme"].getTable()
       lastName = themeTbl.getOrDefault("last_chosen").getStr("")
     except CatchableError:
-      echo "NimLaunch warning: ignoring invalid [theme] section in ", cfgPath
+      stderr.writeLine "NimLaunch warning: ignoring invalid [theme] section in " & cfgPath
   var pickedIndex = -1
   if lastName.len > 0:
     for i, th in ctx.themeList:
@@ -384,13 +451,12 @@ proc initLauncherConfig*() =
   if baseMatchFgColorHex.len == 0:
     baseMatchFgColorHex = ctx.config.matchFgColorHex
   applyTheme(ctx.config, chosen)
-  if chosen != lastName:
-    saveLastTheme(cfgPath)
+  if configValid and chosen != lastName:
+    discard saveLastTheme(cfgPath)
 
   ## guard rails for ctx.config values that affect layout/search limits
   ctx.config.winWidth = clamp(ctx.config.winWidth, 200, 4000)
-  if ctx.config.maxVisibleItems < 1:
-    ctx.config.maxVisibleItems = 1
+  ctx.config.maxVisibleItems = clamp(ctx.config.maxVisibleItems, 1, 100)
   if ctx.config.borderWidth < 0:
     ctx.config.borderWidth = 0
   elif ctx.config.borderWidth > 64:
@@ -401,7 +467,7 @@ proc initLauncherConfig*() =
   ctx.config.opacity = clamp(ctx.config.opacity, 0.1, 1.0)
 
   ## derived geometry
-  ctx.config.winMaxHeight = 40 + ctx.config.maxVisibleItems * ctx.config.lineHeight
+  ctx.config.winMaxHeight = gui.estimatedWindowHeight()
   let maxUsableBorder = max(0, (min(ctx.config.winWidth, ctx.config.winMaxHeight) - 1) div 2)
   if ctx.config.borderWidth > maxUsableBorder:
     ctx.config.borderWidth = maxUsableBorder

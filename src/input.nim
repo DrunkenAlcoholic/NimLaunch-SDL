@@ -113,13 +113,11 @@ proc shouldExitOnFocusLoss*(fs: FocusState): bool =
   let postGain = (now - fs.lastGainMs) > 150
   fs.hadFocus and armed and postGain
 
-proc handleVimCommandKey*(sym: Keycode; ctrlHeld: bool;
-    suppressText: var bool): bool =
+proc handleVimCommandKey*(sym: Keycode; ctrlHeld: bool): bool =
   ## Handle Vim command-line keys. Return true if the key was consumed.
   case sym
   of K_RETURN:
     executeVimCommand()
-    suppressText = true
     true
   of K_BACKSPACE, K_DELETE:
     if ctx.vim.buffer.len > 0:
@@ -127,7 +125,6 @@ proc handleVimCommandKey*(sym: Keycode; ctrlHeld: bool;
       syncVimCommand()
     else:
       closeVimCommand(restoreInput = true, preserveBuffer = false)
-    suppressText = true
     true
   else:
     if ctrlHeld and sym == K_h:
@@ -136,23 +133,19 @@ proc handleVimCommandKey*(sym: Keycode; ctrlHeld: bool;
         syncVimCommand()
       else:
         closeVimCommand(restoreInput = true, preserveBuffer = false)
-      suppressText = true
       return true
     if ctrlHeld and sym == K_u:
       ctx.vim.buffer.setLen(0)
       syncVimCommand()
-      suppressText = true
       return true
     if sym == K_ESCAPE:
       let restore = ctx.vim.buffer.len == 0
       closeVimCommand(restoreInput = restore, preserveBuffer = true)
-      suppressText = true
       return true
     ## Printable characters are handled by TextInput; do not block.
     false
 
-proc handleVimNormalKey*(sym: Keycode; modState: Keymod;
-    suppressText: var bool): bool =
+proc handleVimNormalKey*(sym: Keycode; modState: Keymod): bool =
   ## Handle Vim-mode nav keys when not in command-line. Return true if consumed.
   let shiftHeld = (modState and ShiftMask) != 0
 
@@ -166,42 +159,35 @@ proc handleVimNormalKey*(sym: Keycode; modState: Keymod;
       jumpToTop()
     else:
       ctx.vim.pendingG = true
-    suppressText = true
     true
   of K_j:
     ctx.vim.pendingG = false
     moveSelectionBy(1)
-    suppressText = true
     true
   of K_k:
     ctx.vim.pendingG = false
     moveSelectionBy(-1)
-    suppressText = true
     true
   of K_h:
     ctx.vim.pendingG = false
     deleteLastInputChar()
-    suppressText = true
     true
   of K_l:
     ctx.vim.pendingG = false
     activateCurrentSelection()
-    suppressText = true
     true
   of K_ESCAPE:
     ctx.shouldExit = true
-    suppressText = true
     true
   else:
     ctx.vim.pendingG = false
     false
 
-proc handleVimKey*(sym: Keycode; modState: Keymod;
-    suppressText: var bool) =
+proc handleVimKey*(sym: Keycode; modState: Keymod): bool =
   if ctx.vim.active:
-    discard handleVimCommandKey(sym, (modState and CtrlMask) != 0, suppressText)
+    handleVimCommandKey(sym, (modState and CtrlMask) != 0)
   else:
-    discard handleVimNormalKey(sym, modState, suppressText)
+    handleVimNormalKey(sym, modState)
 
 proc resetVimState*() =
   ctx.vim = VimCommandState()
@@ -256,7 +242,7 @@ proc closeVimCommand*(restoreInput = false; preserveBuffer = false) =
 
     if ctx.filteredApps.len > 0:
       let clampedSel = max(0, min(savedSelected, ctx.filteredApps.len - 1))
-      let visibleRows = max(1, ctx.config.maxVisibleItems)
+      let visibleRows = gui.visibleRowCount()
       let maxOffset = max(0, ctx.filteredApps.len - visibleRows)
       var newOffset = max(0, min(savedOffset, maxOffset))
       if clampedSel < newOffset:
@@ -341,8 +327,7 @@ proc handleWindowEvent*(ev: Event; focus: var FocusState): bool =
 
   needsRedraw
 
-proc handleKeyDown*(ev: Event; focus: var FocusState;
-    suppressNextTextInput: var bool): bool =
+proc handleKeyDown*(ev: Event; focus: var FocusState): bool =
   let sym = ev.key.key
   let modState = ev.key.`mod`
   let ctrlHeld = (modState and CtrlMask) != 0
@@ -351,13 +336,10 @@ proc handleKeyDown*(ev: Event; focus: var FocusState;
   focus.hadFocus = true
   if ctrlHeld and sym == K_v:
     handled = pasteInputText()
-    suppressNextTextInput = handled
   elif shiftHeld and sym == K_INSERT:
     handled = pasteInputText()
-    suppressNextTextInput = handled
   elif ctx.config.vimMode:
-    handleVimKey(sym, modState, suppressNextTextInput)
-    handled = suppressNextTextInput
+    handled = handleVimKey(sym, modState)
   elif sym == K_u and ctrlHeld:
     clearInput()
     handled = true
@@ -388,11 +370,11 @@ proc handleKeyDown*(ev: Event; focus: var FocusState;
       handled = true
     of K_PAGEUP:
       if ctx.filteredApps.len > 0:
-        moveSelectionBy(-max(1, ctx.config.maxVisibleItems))
+        moveSelectionBy(-gui.visibleRowCount())
       handled = true
     of K_PAGEDOWN:
       if ctx.filteredApps.len > 0:
-        moveSelectionBy(max(1, ctx.config.maxVisibleItems))
+        moveSelectionBy(gui.visibleRowCount())
       handled = true
     of K_HOME:
       jumpToTop()
@@ -405,11 +387,7 @@ proc handleKeyDown*(ev: Event; focus: var FocusState;
 
   handled
 
-proc handleTextInput*(ev: Event; focus: var FocusState;
-    suppressNextTextInput: var bool): bool =
-  if suppressNextTextInput:
-    suppressNextTextInput = false
-    return false
+proc handleTextInput*(ev: Event; focus: var FocusState): bool =
   let s = $ev.text.text
   focus.hadFocus = true
   if ctx.config.vimMode and not ctx.vim.active and s.len > 0:

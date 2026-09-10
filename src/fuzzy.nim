@@ -1,17 +1,17 @@
 ## fuzzy.nim — fuzzy matching, typo tolerance, and highlight helpers.
 
-import std/[strutils, times, tables]
+import std/[strutils, times, tables, unicode]
 import ./state
 
-proc recentBoost*(name: string): int =
+proc recentBoost*(key: string): int =
   ## Small score bonus for recently used apps (first is strongest).
-  let idx = ctx.recentApps.find(name)
+  let idx = ctx.recentApps.find(key)
   if idx >= 0: return max(0, 200 - idx * 40)
   0
 
-proc usageBoost*(name: string): int =
+proc usageBoost*(key: string): int =
   ## Small persistent score layer based on launch frequency and recency.
-  let stats = ctx.appUsage.getOrDefault(name)
+  let stats = ctx.appUsage.getOrDefault(key)
   if stats.launchCount <= 0 and stats.lastLaunched <= 0:
     return 0
   let frequency = min(stats.launchCount, 20) * 30
@@ -25,27 +25,37 @@ proc usageBoost*(name: string): int =
   frequency + recency
 
 proc subseqPositions*(q, t: string): seq[int] =
-  ## Case-insensitive subsequence positions of q within t (for highlight).
+  ## Return UTF-8 byte offsets for a case-insensitive rune subsequence.
   if q.len == 0: return @[]
-  var qi = 0
-  for i in 0 ..< t.len:
-    if qi < q.len and toLowerAscii(t[i]) == toLowerAscii(q[qi]):
-      result.add i
-      inc qi
-      if qi == q.len: return
+  let queryRunes = q.toRunes()
+  var queryIndex = 0
+  var byteOffset = 0
+  for rune in t.runes:
+    if queryIndex < queryRunes.len and
+        rune.toLower() == queryRunes[queryIndex].toLower():
+      result.add byteOffset
+      inc queryIndex
+      if queryIndex == queryRunes.len:
+        return
+    byteOffset += rune.size
   result.setLen(0)
 
 proc subseqSpans*(q, t: string): seq[(int, int)] =
-  ## Convert positions to 1-char spans for highlighting.
-  for p in subseqPositions(q, t): result.add (p, 1)
+  ## Convert rune positions to valid UTF-8 byte spans for highlighting.
+  for p in subseqPositions(q, t):
+    result.add (p, runeAt(t, p).size)
 
 proc isWordBoundary*(lt: string; idx: int): bool =
   ## Basic token boundary check for nicer scoring.
   if idx <= 0: return true
-  let c = lt[idx-1]
-  c == ' ' or c == '-' or c == '_' or c == '.' or c == '/'
+  var previous = idx - 1
+  while previous > 0 and (ord(lt[previous]) and 0xC0) == 0x80:
+    dec previous
+  let rune = runeAt(lt, previous)
+  rune in [Rune(' '), Rune('-'), Rune('_'), Rune('.'), Rune('/')]
 
-proc withinOneEdit(a: string, b: openArray[char]): bool =
+proc withinOneEdit(a, b: openArray[Rune]): bool =
+  ## Return true when two rune sequences differ by at most one edit.
   let m = a.len; let n = b.len
   if abs(m - n) > 1: return false
   var i = 0; var j = 0; var edits = 0
@@ -59,7 +69,8 @@ proc withinOneEdit(a: string, b: openArray[char]): bool =
   edits += (m - i) + (n - j)
   edits <= 1
 
-proc withinOneTransposition(a: string, b: openArray[char]): bool =
+proc withinOneTransposition(a, b: openArray[Rune]): bool =
+  ## Return true when rune sequences differ by one adjacent swap.
   if a.len != b.len or a.len < 2: return false
   var k = 0
   while k < a.len and a[k] == b[k]: inc k
@@ -75,36 +86,45 @@ proc scoreMatch*(q, lq, t, lt, fullPath, home: string): int =
   ## Heuristic score for matching q against t (higher is better).
   ## Typo-friendly: 1 edit (ins/del/sub) or one adjacent transposition.
   if q.len == 0: return -1_000_000
-  let pos = lt.find(lq)
+  let normalizedQuery = unicode.toLower(q)
+  let normalizedText = unicode.toLower(t)
+  let queryRunes = normalizedQuery.toRunes()
+  let textRunes = normalizedText.toRunes()
+  let pos = normalizedText.find(normalizedQuery)
 
   var s = -1_000_000
   if pos >= 0:
     s = 1000
     if pos == 0: s += 200
-    if isWordBoundary(lt, pos): s += 80
+    if isWordBoundary(normalizedText, pos): s += 80
     s += max(0, 60 - (t.len - q.len))
 
   if t == q: s += 9000
-  elif lt == lq: s += 8600
-  elif lt.startsWith(lq): s += 8200
+  elif normalizedText == normalizedQuery: s += 8600
+  elif normalizedText.startsWith(normalizedQuery): s += 8200
   elif pos >= 0: s += 7800
   else:
     var typoHit = false
 
     ## Whole-string typo tolerance (1 edit or adjacent swap).
-    if lq.len > 0 and (withinOneEdit(lq, lt) or withinOneTransposition(lq, lt)):
+    if queryRunes.len > 0 and
+        (withinOneEdit(queryRunes, textRunes) or
+         withinOneTransposition(queryRunes, textRunes)):
       typoHit = true
       s = max(s, 7600)
 
     ## Substring typo tolerance to catch near-start matches.
-    if not typoHit and lq.len > 0:
-      let sizes = [max(1, lq.len - 1), lq.len, lq.len + 1]
+    if not typoHit and queryRunes.len > 0:
+      let sizes = [max(1, queryRunes.len - 1), queryRunes.len,
+          queryRunes.len + 1]
       for L in sizes:
-        if L > lt.len: continue
+        if L > textRunes.len: continue
         var start = 0
-        let maxStart = lt.len - L
+        let maxStart = textRunes.len - L
         while start <= maxStart:
-          if withinOneEdit(lq, toOpenArray(lt, start, start + L - 1)) or withinOneTransposition(lq, toOpenArray(lt, start, start + L - 1)):
+          let candidate = textRunes[start..<start + L]
+          if withinOneEdit(queryRunes, candidate) or
+              withinOneTransposition(queryRunes, candidate):
             typoHit = true
             var base = 7700
             if start == 0: base = 7950
@@ -114,6 +134,6 @@ proc scoreMatch*(q, lq, t, lt, fullPath, home: string): int =
         if typoHit: break
 
   if fullPath.startsWith(home & "/"):
-    if lt == lq: s += 600
-    elif lt.startsWith(lq): s += 400
+    if normalizedText == normalizedQuery: s += 600
+    elif normalizedText.startsWith(normalizedQuery): s += 400
   s

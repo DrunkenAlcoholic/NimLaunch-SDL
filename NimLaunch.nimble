@@ -3,7 +3,7 @@ import std/os
 # Package
 
 packageName   = "nimlaunch"
-version       = "0.11.4"
+version       = "0.11.5"
 author        = "Vyrnexis"
 description   = "NimLaunch in SDL3 for native X11 and Wayland"
 license       = "MIT"
@@ -66,11 +66,12 @@ task zigDebug, "Debug build with Zig compiler":
 
 task test, "Run all test suites":
   mkDir("bin")
-  exec "nim c -r -o:./bin/tfuzzy tests/tfuzzy.nim"
-  exec "nim c -r -o:./bin/tparser tests/tparser.nim"
-  exec "nim c -r -o:./bin/tconfig tests/tconfig.nim"
-  exec "nim c -r -o:./bin/tcache tests/tcache.nim"
-  exec "nim c -r -o:./bin/tutils tests/tutils.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tfuzzy -o:./bin/tfuzzy tests/tfuzzy.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tparser -o:./bin/tparser tests/tparser.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tconfig -o:./bin/tconfig tests/tconfig.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tcache -o:./bin/tcache tests/tcache.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tutils -o:./bin/tutils tests/tutils.nim"
+  exec "nim c -r --nimcache:./bin/nimcache-tlogic -o:./bin/tlogic tests/tlogic.nim"
 
 task clean, "Remove build artifacts and caches":
   rmDir("bin")

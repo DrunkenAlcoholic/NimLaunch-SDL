@@ -1,6 +1,6 @@
 ## proc_utils.nim — process spawning, terminal selection, and file-opening helpers.
 
-import std/[os, osproc, strutils]
+import std/[os, osproc, strutils, syncio]
 import ./[state, parser]
 
 proc whichExists*(name: string): bool =
@@ -82,7 +82,7 @@ proc openPathWithFallback*(path: string): bool =
           options = {poDaemon})
       return true
     except CatchableError:
-      echo "openPathWithFallback failed: ", resolved
+      stderr.writeLine "openPathWithFallback failed: " & resolved
   false
 
 proc chooseTerminal*(): string =
@@ -135,8 +135,9 @@ proc buildShellCommand*(cmd, shExe: string; hold = false):
     tuple[fullCmd: string; shArgs: seq[string]] =
   ## Run user's command in a group, and add a robust hold prompt when needed.
   ## Grouping prevents suffix binding to pipelines/conditionals.
-  let suffix = (if hold: "" else: "; printf '\\n[Press Enter to close]\\n'; read -r _")
-  let fullCmd = "{ " & cmd & " ; }" & suffix
+  let suffix = if hold: "" else:
+    "\nprintf '\\n[Press Enter to close]\\n'\nread -r _"
+  let fullCmd = "{\n" & cmd & "\n}" & suffix
   let shArgs = if shExe.endsWith("bash"): @["-lc", fullCmd] else: @["-c", fullCmd]
   (fullCmd, shArgs)
 
@@ -147,13 +148,13 @@ proc runCommand*(cmd: string): bool =
 
   var parts = tokenize(chooseTerminal())
   if parts.len == 0:
-    echo "runCommand failed: No terminal emulator configured or found."
+    stderr.writeLine "runCommand failed: No terminal emulator configured or found."
     return false
 
   let exe = parts[0]
   let exePath = findExe(exe)
   if exePath.len == 0:
-    echo "runCommand failed: Terminal emulator '", exe, "' not found."
+    stderr.writeLine "runCommand failed: Terminal emulator '" & exe & "' not found."
     return false
 
   var termArgs = if parts.len > 1: parts[1..^1] else: @[]
@@ -166,7 +167,7 @@ proc runCommand*(cmd: string): bool =
                          options = {poDaemon, poParentStreams})
     true
   except CatchableError as e:
-    echo "runCommand failed: ", cmd, " (", e.name, "): ", e.msg
+    stderr.writeLine "runCommand failed: " & cmd & " (" & $e.name & "): " & e.msg
     false
 
 proc spawnShellCommand*(cmd: string): bool =
@@ -176,17 +177,21 @@ proc spawnShellCommand*(cmd: string): bool =
                          options = {poDaemon, poParentStreams})
     true
   except CatchableError as e:
-    echo "spawnShellCommand failed: ", cmd, " (", e.name, "): ", e.msg
+    stderr.writeLine "spawnShellCommand failed: " & cmd & " (" & $e.name & "): " & e.msg
     false
 
-proc spawnProcess*(exe: string; args: openArray[string]): bool =
+proc spawnProcess*(exe: string; args: openArray[string]; workingDir = ""): bool =
   ## Execute *exe* directly without a shell in the background; return success.
+  if workingDir.len > 0 and not dirExists(workingDir):
+    stderr.writeLine "spawnProcess failed: working directory not found: " & workingDir
+    return false
   try:
     discard startProcess(exe, args = args,
+                         workingDir = workingDir,
                          options = {poDaemon, poParentStreams, poUsePath})
     true
   except CatchableError as e:
-    echo "spawnProcess failed: ", exe, " (", e.name, "): ", e.msg
+    stderr.writeLine "spawnProcess failed: " & exe & " (" & $e.name & "): " & e.msg
     false
 
 proc openUrl*(url: string): bool =
@@ -196,5 +201,5 @@ proc openUrl*(url: string): bool =
                          options = {poDaemon, poParentStreams})
     true
   except CatchableError as e:
-    echo "openUrl failed: ", url, " (", e.name, "): ", e.msg
+    stderr.writeLine "openUrl failed: " & url & " (" & $e.name & "): " & e.msg
     false

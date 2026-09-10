@@ -16,12 +16,15 @@ suite "Cache serialization tests":
       nameLower: "test app",
       exec: "app %U",
       desktopFile: "/usr/share/applications/test-app.desktop",
+      desktopId: "test-app.desktop",
+      workingDir: "/tmp",
       icon: "test-app",
       hasIcon: true,
       desktopActions: @[action1]
     )
     let orig = CacheData(
       formatVersion: 8,
+      environmentSignature: "test-locale-and-path",
       appDirs: @["/usr/share/applications"],
       dirMtimes: @[1700000000'i64],
       dirSignatures: @["1:1700000000:1700000000:1024:9999"],
@@ -33,6 +36,7 @@ suite "Cache serialization tests":
     let restored = to(parsedNode, CacheData)
 
     check restored.formatVersion == orig.formatVersion
+    check restored.environmentSignature == orig.environmentSignature
     check restored.appDirs == orig.appDirs
     check restored.dirMtimes == orig.dirMtimes
     check restored.dirSignatures == orig.dirSignatures
@@ -42,6 +46,8 @@ suite "Cache serialization tests":
     check restoredApp.name == "Test App"
     check restoredApp.exec == "app %U"
     check restoredApp.desktopFile == "/usr/share/applications/test-app.desktop"
+    check restoredApp.desktopId == "test-app.desktop"
+    check restoredApp.workingDir == "/tmp"
     check restoredApp.icon == "test-app"
     check restoredApp.hasIcon == true
     check restoredApp.desktopActions.len == 1

@@ -13,22 +13,27 @@ proc tokenize*(cmd: string): seq[string] =
   var cur = newStringOfCap(32)
   var i = 0
   var inQuote = '\0'
+  var tokenStarted = false
   while i < cmd.len:
     let c = cmd[i]
     if inQuote == '\0':
       case c
       of ' ', '\t':
-        if cur.len > 0:
+        if tokenStarted:
           result.add cur
           cur.setLen(0)
+          tokenStarted = false
       of '"', '\'':
         inQuote = c
+        tokenStarted = true
       of '\\':
         if i+1 < cmd.len:
           cur.add cmd[i+1]
           inc i
+          tokenStarted = true
       else:
         cur.add c
+        tokenStarted = true
     else:
       if c == inQuote:
         inQuote = '\0'
@@ -37,8 +42,9 @@ proc tokenize*(cmd: string): seq[string] =
         inc i
       else:
         cur.add c
+        tokenStarted = true
     inc i
-  if cur.len > 0:
+  if tokenStarted:
     result.add cur
 
 proc expandExecToken(token, name, icon, desktopFile: string;
@@ -46,6 +52,7 @@ proc expandExecToken(token, name, icon, desktopFile: string;
   ## Expand field codes in one token and append any resulting arguments.
   var expanded = newStringOfCap(token.len + name.len)
   var discardToken = false
+  var hadFieldCode = false
   var i = 0
   while i < token.len:
     if token[i] != '%':
@@ -54,6 +61,7 @@ proc expandExecToken(token, name, icon, desktopFile: string;
     elif i + 1 >= token.len:
       return false
     else:
+      hadFieldCode = true
       case token[i + 1]
       of '%':
         expanded.add '%'
@@ -75,7 +83,7 @@ proc expandExecToken(token, name, icon, desktopFile: string;
       else:
         return false
       inc i, 2
-  if not discardToken and expanded.len > 0:
+  if not discardToken and (expanded.len > 0 or not hadFieldCode):
     args.add expanded
   true
 
@@ -251,6 +259,8 @@ proc parseDesktopFile*(path: string): Option[DesktopApp] =
   let name = getBestValue(kv, "Name")
   let exec = kv.getOrDefault("Exec", "")
   let icon = kv.getOrDefault("Icon", "")
+  let workingDir = kv.getOrDefault("Path", "")
+  let entryType = kv.getOrDefault("Type", "Application")
   let noDisplay = kv.getOrDefault("NoDisplay", "false").toLowerAscii() == "true"
   let hidden = kv.getOrDefault("Hidden", "false").toLowerAscii() == "true"
   let terminalApp = kv.getOrDefault("Terminal", "false").toLowerAscii() == "true"
@@ -264,7 +274,7 @@ proc parseDesktopFile*(path: string): Option[DesktopApp] =
       tryExecMissing = true
 
   let launchable =
-    name.len > 0 and exec.len > 0 and
+    entryType == "Application" and name.len > 0 and exec.len > 0 and
     execExpansion.valid and not noDisplay and not hidden and not terminalApp and
     not tryExecMissing
 
@@ -298,6 +308,7 @@ proc parseDesktopFile*(path: string): Option[DesktopApp] =
       nameLower: name.toLowerAscii(),
       exec: exec,
       desktopFile: path,
+      workingDir: workingDir,
       icon: icon,
       hasIcon: icon.len > 0,
       desktopActions: desktopActions

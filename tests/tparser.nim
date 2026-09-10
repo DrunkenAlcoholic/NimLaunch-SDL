@@ -10,6 +10,9 @@ suite "Parser tests":
     let toks = tokenize("cmd -arg \"hello world\" 'foo bar'")
     check toks == @["cmd", "-arg", "hello world", "foo bar"]
 
+  test "tokenize preserves an explicitly empty argument":
+    check tokenize("cmd \"\" tail") == @["cmd", "", "tail"]
+
   test "tokenize escapes":
     let toks = tokenize("cmd \"hello \\\"world\\\"\"")
     check toks == @["cmd", "hello \"world\""]
@@ -58,6 +61,7 @@ suite "Parser tests":
     writeFile(tmp, """[Desktop Entry]
 Name=SuperApp
 Exec=superapp %U
+Path=/tmp
 Icon=superapp-icon
 Categories=Network;WebBrowser;
 Actions=NewTab;
@@ -76,6 +80,7 @@ Icon=tab-new
     check app.name == "SuperApp"
     check app.exec == "superapp %U"
     check app.desktopFile == tmp
+    check app.workingDir == "/tmp"
     check app.icon == "superapp-icon"
     check app.hasIcon == true
     check app.desktopActions.len == 1

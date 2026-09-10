@@ -24,6 +24,7 @@ type
   ## A single launchable application parsed from a `.desktop` file.
   DesktopApp* = object
     name*, nameLower*, exec*, desktopFile*: string
+    desktopId*, workingDir*: string
     icon*: string
     hasIcon*: bool
     desktopActions*: seq[DesktopEntryAction]
@@ -31,6 +32,7 @@ type
   ## Payload cached to `~/.cache/nimlaunch/apps.json`.
   CacheData* = object
     formatVersion*: int
+    environmentSignature*: string
     appDirs*: seq[string]
     dirMtimes*: seq[int64]
     dirSignatures*: seq[string]
@@ -166,6 +168,7 @@ type
     dmenuMode*: bool
     dmenuItems*: seq[DmenuItem]
     dmenuAccepted*: bool
+    dmenuDryRunAccepted*: bool
     dmenuOutput*: string
     dmenuPrompt*: string
     listThemesMode*: bool

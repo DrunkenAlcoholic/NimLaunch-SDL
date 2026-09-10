@@ -1,7 +1,7 @@
 ## app_core.nim — NimLaunch application logic for search, actions, and launch flow.
 
 import std/[os, strutils, tables, sets, uri,
-            algorithm, heapqueue, exitprocs]
+            algorithm, heapqueue, exitprocs, syncio]
 when defined(posix):
   import posix
 import ./[state, parser, gui, utils, settings, paths, fuzzy, proc_utils, search,
@@ -48,8 +48,12 @@ const
 
 var
   lockFilePath = ""
+  pendingSearchQuery = ""
+  pendingSearchGeneration = 0
 when defined(posix):
   var lockFd: cint = -1
+
+proc buildActions*()
 
 proc pickIcon(app: DesktopApp): string =
   ## Choose an icon name for a DesktopApp, using explicit icon, alias, or base exec.
@@ -93,11 +97,6 @@ when defined(posix):
       discard flock(lockFd, LOCK_UN)
       discard close(lockFd)
       lockFd = -1
-    if lockFilePath.len > 0 and fileExists(lockFilePath):
-      try:
-        removeFile(lockFilePath)
-      except CatchableError:
-        discard
 
   proc ensureSingleInstance*(): bool =
     ## Obtain an exclusive advisory lock; return false if another instance owns it.
@@ -108,9 +107,12 @@ when defined(posix):
       discard
     lockFilePath = cacheDirPath / "nimlaunch.lock"
 
-    let fd = open(lockFilePath.cstring, O_RDWR or O_CREAT, 0o664)
+    var openFlags = O_RDWR or O_CREAT
+    when declared(O_CLOEXEC):
+      openFlags = openFlags or O_CLOEXEC
+    let fd = open(lockFilePath.cstring, openFlags, 0o600)
     if fd < 0:
-      echo "NimLaunch warning: unable to open lock file at ", lockFilePath
+      stderr.writeLine "NimLaunch warning: unable to open lock file at " & lockFilePath
       return true
 
     if flock(fd, LOCK_EX or LOCK_NB) != 0:
@@ -378,8 +380,12 @@ proc buildSearchActions(rest: string): seq[Action] =
   elif getCachedSearchResults(rest, paths):
     discard
   else:
-    paths = scanFilesFast(rest)
-    cacheSearchResults(rest, paths)
+    if pendingSearchQuery != rest:
+      let generation = requestFileSearch(rest)
+      if generation > 0:
+        pendingSearchQuery = rest
+        pendingSearchGeneration = generation
+    return @[Action(kind: akPlaceholder, label: "Searching…", exec: "")]
 
   lastSearchQuery = rest
   lastSearchResults = paths
@@ -414,6 +420,22 @@ proc buildSearchActions(rest: string): seq[Action] =
 
   if result.len == 0:
     result.add Action(kind: akPlaceholder, label: "No matches", exec: "")
+
+## Apply the latest completed file search and rebuild matching actions.
+proc pollSearchUpdates*(): bool =
+  var response: SearchResponse
+  while pollFileSearch(response):
+    if response.generation == pendingSearchGeneration:
+      pendingSearchQuery.setLen(0)
+      pendingSearchGeneration = 0
+      cacheSearchResults(response.query, response.paths)
+      let (cmd, rest, _, _) = parseCommand(ctx.inputText)
+      if cmd == ckSearch:
+        if rest == response.query:
+          lastSearchQuery = response.query
+          lastSearchResults = response.paths
+        buildActions()
+        result = true
 
 proc buildDmenuActions(rest: string): seq[Action] =
   ## Dmenu mode — filter stdin-provided lines and return the raw selection.
@@ -452,24 +474,32 @@ proc buildDefaultActions(rest: string; defaultIndex: var int): seq[Action] =
   defaultIndex = 0
   if rest.len == 0:
     var index = initTable[string, DesktopApp](ctx.allApps.len * 2)
+    var nameCounts = initCountTable[string]()
     for app in ctx.allApps:
-      index[app.name] = app
+      index[appIdentity(app)] = app
+      nameCounts.inc(app.name)
 
     var seen = initHashSet[string]()
-    for name in ctx.recentApps:
-      if index.hasKey(name):
-        let app = index[name]
+    for recentKey in ctx.recentApps:
+      var key = recentKey
+      if not index.hasKey(key) and nameCounts[recentKey] == 1:
+        for app in ctx.allApps:
+          if app.name == recentKey:
+            key = appIdentity(app)
+            break
+      if index.hasKey(key) and key notin seen:
+        let app = index[key]
         let iconName = if ctx.config.showIcons: pickIcon(app) else: ""
         result.add Action(kind: akApp, label: app.name, exec: app.exec,
             appData: app, iconName: iconName)
-        seen.incl name
+        seen.incl key
 
     var remaining: seq[DesktopApp] = @[]
     for app in ctx.allApps:
-      if not seen.contains(app.name):
+      if appIdentity(app) notin seen:
         remaining.add app
     remaining.sort(proc(a, b: DesktopApp): int =
-      result = cmp(usageBoost(b.name), usageBoost(a.name))
+      result = cmp(usageBoost(appIdentity(b)), usageBoost(appIdentity(a)))
       if result == 0:
         result = cmpIgnoreCase(a.name, b.name)
     )
@@ -484,7 +514,8 @@ proc buildDefaultActions(rest: string; defaultIndex: var int): seq[Action] =
     for i, app in ctx.allApps:
       let s = scoreMatch(rest, queryLower, app.name, app.nameLower, app.name, "")
       if s > -1_000_000:
-        push(top, (s + recentBoost(app.name) + usageBoost(app.name), i))
+        let key = appIdentity(app)
+        push(top, (s + recentBoost(key) + usageBoost(key), i))
         if top.len > limit: discard pop(top)
     var ranked: seq[(int, int)] = @[]
     while top.len > 0: ranked.add pop(top)
@@ -541,7 +572,7 @@ proc updateDisplayRows(cmd: CmdKind; highlightQuery: string;
     if cmd == ckTheme and defaultIndex == 0:
       clamped = min(ctx.selectedIndex, maxIndex)
     ctx.selectedIndex = clamped
-    let visible = max(1, ctx.config.maxVisibleItems)
+    let visible = gui.visibleRowCount()
     if clamped >= visible:
       ctx.viewOffset = clamped - visible + 1
     else:
@@ -604,6 +635,9 @@ proc clearInput*() =
 proc performAction*(a: Action) =
   if ctx.dryRunMode:
     stdout.write(a.exec & "\n")
+    if a.kind == akDmenu:
+      ctx.dmenuAccepted = true
+      ctx.dmenuDryRunAccepted = true
     ctx.shouldExit = true
     return
 
@@ -627,9 +661,9 @@ proc performAction*(a: Action) =
     let args = expansion.args
     var success = false
     if expansion.valid and args.len > 0:
-      success = spawnProcess(args[0], args[1..^1])
+      success = spawnProcess(args[0], args[1..^1], a.appData.workingDir)
     if success:
-      recordAppLaunch(a.label)
+      recordAppLaunch(a.appData)
     else:
       gui.notifyStatus("Failed: " & a.label, 1600)
       exitAfter = false
@@ -639,9 +673,9 @@ proc performAction*(a: Action) =
     let args = expansion.args
     var success = false
     if expansion.valid and args.len > 0:
-      success = spawnProcess(args[0], args[1..^1])
+      success = spawnProcess(args[0], args[1..^1], a.appData.workingDir)
     if success:
-      recordAppLaunch(a.appData.name)
+      recordAppLaunch(a.appData)
     else:
       gui.notifyStatus("Failed: " & a.label, 1600)
       exitAfter = false
@@ -678,7 +712,7 @@ proc performAction*(a: Action) =
     ## Apply and persist, but DO NOT reset selection or exit.
     applyThemeAndColors(ctx.config, a.exec, doNotify = false, doRedraw = false)
     let targetPath = if ctx.configOverridePath.len > 0: ctx.configOverridePath else: configDir() / "nimlaunch.toml"
-    saveLastTheme(targetPath)
+    discard saveLastTheme(targetPath)
     endThemePreviewSession(true)
     clearInput()
     gui.redrawWindow()
@@ -708,10 +742,11 @@ proc moveSelectionBy*(step: int) =
   if newIndex > ctx.filteredApps.len - 1: newIndex = ctx.filteredApps.len - 1
   if newIndex == ctx.selectedIndex: return
   ctx.selectedIndex = newIndex
+  let visibleRows = gui.visibleRowCount()
   if ctx.selectedIndex < ctx.viewOffset:
     ctx.viewOffset = ctx.selectedIndex
-  elif ctx.selectedIndex >= ctx.viewOffset + ctx.config.maxVisibleItems:
-    ctx.viewOffset = ctx.selectedIndex - ctx.config.maxVisibleItems + 1
+  elif ctx.selectedIndex >= ctx.viewOffset + visibleRows:
+    ctx.viewOffset = ctx.selectedIndex - visibleRows + 1
     if ctx.viewOffset < 0: ctx.viewOffset = 0
   updateThemePreview(parseCommand(ctx.inputText)[0] == ckTheme, ctx.actions, ctx.selectedIndex)
 
@@ -724,6 +759,6 @@ proc jumpToTop*() =
 proc jumpToBottom*() =
   if ctx.filteredApps.len == 0: return
   ctx.selectedIndex = ctx.filteredApps.len - 1
-  let start = ctx.filteredApps.len - ctx.config.maxVisibleItems
+  let start = ctx.filteredApps.len - gui.visibleRowCount()
   ctx.viewOffset = if start > 0: start else: 0
   updateThemePreview(parseCommand(ctx.inputText)[0] == ckTheme, ctx.actions, ctx.selectedIndex)

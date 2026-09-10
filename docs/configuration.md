@@ -43,6 +43,11 @@ pollIntervalMs = 10
 - **`width`**: Launcher width in pixels, clamped to 200–4000.
 - **`opacity`**: Float between `0.1` and `1.0`. Note that some compositors may ignore this setting.
 - **`max_visible_items`**: Number of rows before scrolling begins; values below 1 become 1.
+
+The window and row height automatically expand to fit the selected font and icons. On a
+small display, NimLaunch reduces the number of visible rows while keeping every row fully
+selectable.
+
 - **`center`**: If `true`, NimLaunch ignores `position_x` and centers the window.
 - **`position_x`**, **`position_y`**: Used only when `center` is `false`.
 - **`vertical_align`**: Used only when centered. Valid values are `top`, `center`, and `one-third`.

@@ -137,7 +137,8 @@ still rasterizes glyphs in software.
 - `--dmenu` looks empty: make sure you are piping newline-separated input into
   it, for example `printf "one\\ntwo\\n" | nimlaunch --dmenu`.
 - Text looks wrong or too small: set `[font].fontname` to an installed font and
-  size (e.g., `"Dejavu:size=16"`).
+  size (e.g., `"Dejavu:size=16"`). Row and window height adjust automatically;
+  the visible row count is reduced only when the display is too small.
 - Wayland/Niri black padding or delayed repaint: use a debug build with
   `-d:nimlaunchWindowDebug` to log window events and redraw timing.
 - Theme changes do not persist: verify the NimLaunch configuration file
